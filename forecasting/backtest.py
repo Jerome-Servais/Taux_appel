@@ -62,7 +62,7 @@ def generate_walk_forward_folds(
 def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 5) -> dict:
     """Backteste UN modèle sur plusieurs replis glissants.
 
-    Retourne un dict avec les métriques agrégées : mae, rmse, bias (erreur
+    Retourne un dict avec les métriques agrégées : mae, wape, rmse, bias (erreur
     signée moyenne — positif = le modèle surestime), coverage (% de valeurs
     réelles dans l'intervalle de confiance ; cible ~95 %), et des informations
     de diagnostic (nombre de replis utilisés/échoués, temps moyen d'ajustement).
@@ -73,13 +73,13 @@ def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 
 
     if not folds:
         return {
-            **label_base, "n_folds": 0, "n_failures": 0, "mae": np.nan, "rmse": np.nan,
+            **label_base, "n_folds": 0, "n_failures": 0, "mae": np.nan, "wape": np.nan, "rmse": np.nan,
             "bias": np.nan, "coverage": np.nan, "avg_fit_time_s": np.nan,
             "error": "Historique trop court pour un backtest robuste.",
         }
 
     model_cls = MODEL_REGISTRY[model_name]
-    all_abs_err, all_sq_err, all_signed_err, all_in_interval = [], [], [], []
+    all_abs_err, all_sq_err, all_signed_err, all_in_interval, all_actual = [], [], [], [], []
     fit_times = []
     n_failures = 0
 
@@ -104,6 +104,7 @@ def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 
         upper = forecast_df["yhat_upper"].to_numpy()[:h]
         err = yhat - actual
 
+        all_actual.append(actual)
         all_abs_err.append(np.abs(err))
         all_sq_err.append(err ** 2)
         all_signed_err.append(err)
@@ -111,7 +112,7 @@ def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 
 
     if not all_abs_err:
         return {
-            **label_base, "n_folds": 0, "n_failures": n_failures, "mae": np.nan, "rmse": np.nan,
+            **label_base, "n_folds": 0, "n_failures": n_failures, "mae": np.nan, "wape": np.nan, "rmse": np.nan,
             "bias": np.nan, "coverage": np.nan, "avg_fit_time_s": np.nan,
             "error": "Tous les replis ont échoué pour ce modèle.",
         }
@@ -121,11 +122,13 @@ def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 
     signed_err = np.concatenate(all_signed_err)
     in_interval = np.concatenate(all_in_interval)
 
+    total_actual = np.concatenate(all_actual).sum()
     return {
         **label_base,
         "n_folds": len(all_abs_err),
         "n_failures": n_failures,
         "mae": float(np.mean(abs_err)),
+        "wape": float(abs_err.sum() / total_actual * 100) if total_actual else np.nan,
         "rmse": float(np.sqrt(np.mean(sq_err))),
         "bias": float(np.mean(signed_err)),
         "coverage": float(np.mean(in_interval) * 100),
@@ -135,8 +138,11 @@ def backtest_model(ts: pd.Series, model_name: str, horizon: int, n_folds: int = 
 
 
 def backtest_all_models(ts: pd.Series, horizon: int, n_folds: int = 5) -> pd.DataFrame:
-    """Backteste tous les modèles du registre, retourne un DataFrame classé
-    par MAE croissante (les modèles en échec total finissent en bas, MAE=NaN)."""
+    """Backteste tous les modèles du registre, classés par MAE croissante. La colonne
+    `gain_vs_reference` donne le gain de MAE en % par rapport au modèle de référence :
+    s'il est faible, le modèle complexe ne se justifie pas."""
     rows = [backtest_model(ts, name, horizon, n_folds) for name in MODEL_REGISTRY]
     df = pd.DataFrame(rows)
+    reference = df.loc[df["model"] == "baseline", "mae"].iloc[0]
+    df["gain_vs_reference"] = (1 - df["mae"] / reference) * 100
     return df.sort_values("mae", na_position="last").reset_index(drop=True)

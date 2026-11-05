@@ -1,15 +1,20 @@
 """
 metrics/anomaly.py — Écarts atypiques et ruptures de tendance.
 
-Principe clé (section 2.4 du cadrage) : la comparaison se fait par rapport à
-l'HISTORIQUE PROPRE du profil, jamais par rapport aux autres profils. Un profil
-au comportement stable mais différent des autres n'est pas une anomalie ; un
-profil qui décroche par rapport à sa propre trajectoire l'est.
+Chaque groupe est comparé à son propre historique, jamais aux autres groupes : un
+profil stable mais différent des autres n'est pas une anomalie. Deux règles
+garantissent qu'une alerte aurait pu être levée au moment des faits :
+
+- la référence n'utilise que des périodes passées ;
+- elle repose sur la médiane et l'écart absolu médian (MAD), qu'un pic isolé ou
+  le début d'une rupture ne déforment pas.
+
+En granularité journalière, la référence compare chaque jour aux mêmes jours de
+semaine, car un lundi ne ressemble pas à un dimanche.
 
 Deux détections complémentaires :
-- z-score / écart en % vs historique propre (fenêtre glissante ou expanding)
-- CUSUM standardisé, pour repérer une rupture de tendance soutenue plutôt
-  qu'un pic ponctuel (section 2.3 du cadrage)
+- z-score robuste : repère un écart ponctuel fort ;
+- CUSUM : additionne de petits écarts pour repérer une rupture durable.
 """
 
 from __future__ import annotations
@@ -17,48 +22,86 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from config import BASELINE_SETTINGS, CUSUM_DEFAULTS_PER_DIM, DEFAULT_FREQ_CODE
+
+MIN_EFFECTIF_DEFAULT = 20
+MAD_TO_STD = 1.4826
+Z_CLIP = 4.0
+
+
+def _mad(values: np.ndarray) -> float:
+    return float(np.nanmedian(np.abs(values - np.nanmedian(values))))
+
+
+def _same_season_history(series: pd.Series, season: int) -> list[pd.Series]:
+    """Découpe une série en sous-séries de même phase (ex. tous les lundis)."""
+    positions = np.arange(len(series)) % season
+    return [series[positions == phase] for phase in range(season)]
+
 
 def add_deviation_from_own_history(
-    df: pd.DataFrame, value_col: str, window: int | None = 6
+    df: pd.DataFrame,
+    value_col: str,
+    group_col: str = "profil_partenaire",
+    freq_code: str = DEFAULT_FREQ_CODE,
+    window: int | None = None,
+    min_effectif: int = MIN_EFFECTIF_DEFAULT,
+    n_col: str = "n_traitements",
 ) -> pd.DataFrame:
-    """Ajoute hist_mean, hist_std, zscore, pct_deviation par profil.
+    """Ajoute hist_ref, hist_scale, zscore et pct_deviation par `group_col`.
 
-    hist_mean/hist_std sont calculés sur les périodes STRICTEMENT antérieures
-    (shift(1)) du même profil, en fenêtre glissante de `window` périodes si
-    fourni, sinon en expanding sur tout l'historique disponible.
+    hist_ref est la médiane des périodes passées et hist_scale leur dispersion,
+    avec un plancher égal au bruit d'un comptage : sans lui, quelques périodes très
+    régulières donneraient une dispersion quasi nulle et des alertes injustifiées.
+    Les lignes sous `min_effectif` n'ont pas de score.
     """
-    df = df.sort_values(["profil_partenaire", "period"]).copy()
+    settings = BASELINE_SETTINGS[freq_code]
+    window = window or settings["window"]
+    min_periods = min(settings["min_periods"], window)
+    season = settings["season"]
 
-    def _hist_mean(s: pd.Series) -> pd.Series:
-        shifted = s.shift(1)
-        return shifted.rolling(window, min_periods=3).mean() if window else shifted.expanding(min_periods=3).mean()
+    df = df.sort_values([group_col, "period"]).copy()
+    df["hist_ref"] = np.nan
+    df["hist_scale"] = np.nan
 
-    def _hist_std(s: pd.Series) -> pd.Series:
-        shifted = s.shift(1)
-        return shifted.rolling(window, min_periods=3).std() if window else shifted.expanding(min_periods=3).std()
+    for _, group in df.groupby(group_col, sort=False):
+        counts = group[n_col] if n_col in group.columns else None
+        for part in _same_season_history(group[value_col].astype(float), season):
+            past = part.shift(1).rolling(window, min_periods=min_periods)
+            reference = past.median()
+            spread = past.apply(_mad, raw=True) * MAD_TO_STD
 
-    df["hist_mean"] = df.groupby("profil_partenaire")[value_col].transform(_hist_mean)
-    df["hist_std"] = df.groupby("profil_partenaire")[value_col].transform(_hist_std)
+            noise = 0.0
+            if counts is not None:
+                past_counts = counts.loc[part.index].shift(1).rolling(window, min_periods=min_periods).median()
+                noise = reference.abs() / np.sqrt(past_counts.clip(lower=1))
 
+            df.loc[part.index, "hist_ref"] = reference
+            df.loc[part.index, "hist_scale"] = np.maximum(spread, noise)
+
+    reliable = df[n_col] >= min_effectif if n_col in df.columns else pd.Series(True, index=df.index)
     df["zscore"] = np.where(
-        df["hist_std"] > 0, (df[value_col] - df["hist_mean"]) / df["hist_std"], np.nan
+        (df["hist_scale"] > 0) & reliable, (df[value_col] - df["hist_ref"]) / df["hist_scale"], np.nan
     )
     df["pct_deviation"] = np.where(
-        df["hist_mean"].abs() > 0,
-        (df[value_col] - df["hist_mean"]) / df["hist_mean"].abs() * 100,
+        (df["hist_ref"].abs() > 0) & reliable,
+        (df[value_col] - df["hist_ref"]) / df["hist_ref"].abs() * 100,
         np.nan,
     )
     return df
 
 
 def flag_alerts(
-    df: pd.DataFrame, threshold_type: str = "zscore", threshold_value: float = 2.0
+    df: pd.DataFrame,
+    threshold_type: str = "zscore",
+    threshold_value: float = 3.0,
+    min_effectif: int = 0,
+    n_col: str = "n_traitements",
 ) -> pd.DataFrame:
-    """Marque is_alert selon le type de seuil choisi dans l'interface.
+    """Marque is_alert selon le seuil choisi (threshold_type : 'zscore' ou 'pct').
 
-    threshold_type: 'zscore' ou 'pct'
-    Une alerte n'est jamais levée sur une ligne jugée non fiable (is_reliable=False,
-    cf. garde-fou volume minimum, metrics/lift.py::apply_min_volume_mask).
+    Aucune alerte sur une ligne jugée non fiable (is_reliable=False) ou dont
+    l'effectif est inférieur à `min_effectif`.
     """
     df = df.copy()
     if threshold_type == "zscore":
@@ -68,49 +111,87 @@ def flag_alerts(
     else:
         raise ValueError("threshold_type doit être 'zscore' ou 'pct'")
 
-    raw_alert = raw_alert.fillna(False)
+    if min_effectif > 0 and n_col in df.columns:
+        raw_alert = raw_alert & (df[n_col] >= min_effectif)
     if "is_reliable" in df.columns:
-        df["is_alert"] = raw_alert & df["is_reliable"]
-    else:
-        df["is_alert"] = raw_alert
+        raw_alert = raw_alert & df["is_reliable"]
+    df["is_alert"] = raw_alert
     return df
 
 
-def _cusum_breaks_1d(x: np.ndarray, k: float, h: float) -> np.ndarray:
-    """CUSUM standardisé (référence = moyenne/écart-type de la série fournie).
+def _online_cusum(
+    counts: np.ndarray, k: float, h: float, season: int, window: int, min_periods: int
+) -> np.ndarray:
+    """CUSUM bilatéral sur le log des comptages, sans regarder le futur.
 
-    k : slack (en écarts-types) toléré autour de la référence avant d'accumuler
-    h : seuil de déclenchement (en écarts-types cumulés) au-delà duquel on
-        considère qu'il y a rupture
+    Retourne +1 ou -1 aux périodes de rupture, 0 ailleurs. Après une rupture, la
+    référence repart de zéro pour apprendre le nouveau niveau, ce qui évite de
+    signaler la même rupture à chaque période suivante.
     """
-    mean = np.nanmean(x)
-    std = np.nanstd(x)
-    if not std or np.isnan(std):
-        return np.zeros(len(x), dtype=bool)
+    values = np.log1p(counts)
+    signals = np.zeros(len(values), dtype=int)
+    history: dict[int, list[float]] = {phase: [] for phase in range(season)}
+    cusum_up = cusum_down = 0.0
 
-    z = (x - mean) / std
-    c_pos = np.zeros(len(z))
-    c_neg = np.zeros(len(z))
-    for i in range(1, len(z)):
-        c_pos[i] = max(0.0, c_pos[i - 1] + z[i] - k)
-        c_neg[i] = min(0.0, c_neg[i - 1] + z[i] + k)
-    return (c_pos > h) | (c_neg < -h)
+    for t, value in enumerate(values):
+        phase = t % season
+        past = np.array(history[phase][-window:])
+        if len(past) < min_periods:
+            history[phase].append(value)
+            continue
+
+        reference = np.median(past)
+        noise = 1 / np.sqrt(np.expm1(reference) + 1)
+        scale = max(MAD_TO_STD * _mad(past), noise)
+        z = np.clip((value - reference) / scale, -Z_CLIP, Z_CLIP)  # un pic seul ne suffit pas
+
+        cusum_up = max(0.0, cusum_up + z - k)
+        cusum_down = min(0.0, cusum_down + z + k)
+        if cusum_up > h or cusum_down < -h:
+            signals[t] = 1 if cusum_up > h else -1
+            cusum_up = cusum_down = 0.0
+            history = {phase: [] for phase in range(season)}
+        history[phase].append(value)
+    return signals
 
 
-def add_cusum_breaks(df: pd.DataFrame, value_col: str, k: float = 0.5, h: float = 5.0) -> pd.DataFrame:
-    """Ajoute une colonne booléenne `cusum_break` par profil (détection de rupture,
-    section 2.3 : 'un profil stable qui décroche')."""
-    df = df.sort_values(["profil_partenaire", "period"]).copy()
-    df["cusum_break"] = False
-    for _, group in df.groupby("profil_partenaire"):
-        x = group[value_col].to_numpy(dtype=float)
-        breaks = _cusum_breaks_1d(x, k=k, h=h)
-        df.loc[group.index, "cusum_break"] = breaks
+def add_cusum_breaks(
+    df: pd.DataFrame,
+    value_col: str,
+    group_col: str = "profil_partenaire",
+    freq_code: str = DEFAULT_FREQ_CODE,
+    k: float | None = None,
+    h: float | None = None,
+    min_effectif: int = MIN_EFFECTIF_DEFAULT,
+    n_col: str = "n_traitements",
+) -> pd.DataFrame:
+    """Ajoute `cusum_break` et `cusum_direction` (+1 hausse, -1 baisse) par groupe.
+
+    `value_col` doit être un comptage. `cusum_break` n'est vrai qu'à la période où
+    la rupture devient détectable. k est la tolérance et h le seuil de déclenchement,
+    tous deux en écarts-types.
+    """
+    defaults = CUSUM_DEFAULTS_PER_DIM.get(group_col, CUSUM_DEFAULTS_PER_DIM["profil_partenaire"])
+    k = defaults["k"] if k is None else k
+    h = defaults["h"] if h is None else h
+    settings = BASELINE_SETTINGS[freq_code]
+
+    df = df.sort_values([group_col, "period"]).copy()
+    df["cusum_direction"] = 0
+    for _, group in df.groupby(group_col, sort=False):
+        df.loc[group.index, "cusum_direction"] = _online_cusum(
+            group[value_col].to_numpy(dtype=float), k, h,
+            settings["season"], settings["window"], settings["min_periods"],
+        )
+
+    if min_effectif > 0 and n_col in df.columns:
+        df.loc[df[n_col] < min_effectif, "cusum_direction"] = 0
+    df["cusum_break"] = df["cusum_direction"] != 0
     return df
 
 
 def period_over_period_table(df: pd.DataFrame, period_a: pd.Timestamp, period_b: pd.Timestamp, value_col: str) -> pd.DataFrame:
-    """Comparaison période sur période (section 2.3), profil par profil."""
+    """Comparaison de deux périodes, profil par profil."""
     a = df[df["period"] == period_a][["profil_partenaire", value_col]].rename(columns={value_col: "value_a"})
     b = df[df["period"] == period_b][["profil_partenaire", value_col]].rename(columns={value_col: "value_b"})
     merged = a.merge(b, on="profil_partenaire", how="outer")

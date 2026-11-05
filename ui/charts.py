@@ -1,8 +1,7 @@
 """
 ui/charts.py — Fonctions de rendu Plotly.
 
-Plotly est utilisé (plutôt que matplotlib) pour l'interactivité et le
-drill-down par profil, comme demandé section 5.1 du cadrage.
+Plotly permet d'explorer les graphiques de façon interactive, profil par profil.
 """
 
 from __future__ import annotations
@@ -116,7 +115,7 @@ def build_time_series_chart(
 
 
 def build_forecast_chart(
-    history: pd.Series, forecast_df: pd.DataFrame, title: str, y_title: str = "Volume d'appels"
+    history: pd.Series, forecast_df: pd.DataFrame, title: str, y_title: str = "Volume de traitements"
 ) -> go.Figure:
     """Historique + prévision avec bande d'incertitude."""
     fig = go.Figure()

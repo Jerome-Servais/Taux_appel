@@ -1,6 +1,4 @@
-# Versions figées volontairement (leçon retenue du projet call center précédent :
-# un requirements.txt sans contrainte de version avait provoqué un segfault).
-# Testé avec Python 3.12.
+# Versions figées pour garantir un environnement reproductible. Testé avec Python 3.12.
 
 streamlit==1.59.0
 pandas==3.0.2

@@ -45,15 +45,20 @@ PORTFOLIO_ALIASES = {
     ],
 }
 
+# Colonnes facultatives de Traitements.csv
+TRAITEMENTS_OPTIONAL_ALIASES = {
+    "motif": ["motif", "motif_contact", "motif_de_contact", "reason"],
+    "sous_motif": ["sous_motif", "sous_motif_contact", "sous_motif_de_contact", "sub_reason"],
+}
+
 # Libellé canonique utilisé pour le profil/la relation contractuelle "fourre-tout",
 # et pour les traitements dont le compte n'a pas pu être identifié (compte
 # manquant -> profil ET relation = ce libellé).
 FALLBACK_SEGMENT_LABEL = "Autres"
 
-# Format de date_contact dans Traitements.csv (confirmé par l'utilisateur) :
-# jour/mois/année heure:minute:seconde. Un parsing sans format explicite
-# suppose par défaut le format américain (mois/jour/année) et inverserait
-# silencieusement jour et mois pour toute date où le jour est <= 12.
+# Format de date_contact : jour/mois/année heure:minute:seconde. Un parsing sans
+# format explicite suppose le format américain et inverserait jour et mois pour
+# toute date dont le jour est <= 12.
 DATE_CONTACT_FORMAT = "%d/%m/%Y %H:%M:%S"
 
 # --- Granularités temporelles disponibles ---
@@ -96,11 +101,46 @@ FORECAST_HORIZON_UNITS = {
     "Trimestre(s)": 13,
 }
 
-# --- Seuils par défaut (garde-fous méthodologiques, section 4) ---
+DEFAULT_FREQ_CODE = "W-MON"
+
+# --- Seuils par défaut (garde-fous méthodologiques) ---
 DEFAULT_MIN_ACCOUNTS = 30
 DEFAULT_MIN_CALLS = 30
-DEFAULT_ZSCORE_THRESHOLD = 2.0
+DEFAULT_ZSCORE_THRESHOLD = 3.0
 DEFAULT_PCT_THRESHOLD = 25.0  # en %
+
+# --- Garde-fou petits effectifs par dimension de détection ---
+# Un sous-motif crée des sous-populations beaucoup plus fines que le profil seul
+# → seuil minimal plus élevé pour éviter le bruit statistique
+# n >= 20 est un compromis standard (CLT approximative, test du chi² nécessitant
+# des effectifs attendus >= 5 par cellule, d'où le facteur de sécurité)
+MIN_EFFECTIF_DEFAULTS: dict[str, int] = {
+    "profil_partenaire": 20,
+    "motif": 25,
+    "sous_motif": 30,
+}
+
+# --- Référence glissante de la détection d'anomalies, par granularité ---
+# window : périodes passées conservées ; min_periods : historique minimal pour
+# calculer un score ; season : 7 compare chaque jour aux mêmes jours de semaine.
+BASELINE_SETTINGS: dict[str, dict[str, int]] = {
+    "D": {"window": 8, "min_periods": 4, "season": 7},
+    "W-MON": {"window": 26, "min_periods": 10, "season": 1},
+    "MS": {"window": 9, "min_periods": 6, "season": 1},
+}
+
+# --- Paramètres CUSUM par dimension (k = tolérance, h = seuil, en écarts-types) ---
+# Motif et sous-motif sont des séries plus bruitées : leurs seuils sont plus larges.
+CUSUM_DEFAULTS_PER_DIM: dict[str, dict[str, float]] = {
+    "profil_partenaire": {"k": 0.75, "h": 6.0},
+    "motif": {"k": 0.75, "h": 6.0},
+    "sous_motif": {"k": 1.0, "h": 7.0},
+}
+
+# --- Surveillance de la part d'un motif (CUSUM binomial) ---
+# odds_ratio : hausse à détecter (2 = les cotes du motif doublent) ;
+# h : seuil de déclenchement ; min_baseline : traitements de référence requis.
+SHARE_CUSUM_DEFAULTS = {"odds_ratio": 2.0, "h": 5.5, "min_baseline": 200}
 
 # --- Intervalle de confiance ---
 CI_METHODS = {
@@ -124,12 +164,13 @@ DEMO_START_DATE = DEMO_END_DATE - timedelta(days=540)  # ~18 mois d'historique
 
 # --- Registre de modèles de prévision disponibles (voir forecasting/registry.py) ---
 FORECAST_MODEL_LABELS = {
+    "negbin_glm": "GLM Binomiale négative (sur-dispersion)",
+    "baseline": "Référence (saisonnière naïve)",
     "linear": "Régression linéaire",
     "sarima": "SARIMA",
     "prophet": "Prophet",
     "xgboost_poisson": "XGBoost (Poisson)",
     "poisson_glm": "GLM Poisson (fréquentiste)",
-    "negbin_glm": "GLM Binomiale négative (sur-dispersion)",
     "bayesian_poisson": "Bayésien Poisson (PyMC)",
     "bayesian_negbin": "Bayésien Binomiale négative (PyMC)",
 }

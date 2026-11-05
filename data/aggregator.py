@@ -1,10 +1,8 @@
 """
 data/aggregator.py — Résolution profil/relation + agrégation par granularité.
 
-Point d'attention (leçon du projet call center) : on vérifie systématiquement
-l'alignement des index après chaque groupby/merge, et on complète explicitement
-les zéros (un profil sans traitement sur une période doit apparaître avec
-n_traitements = 0, pas être absent du tableau).
+Les zéros sont complétés explicitement : un profil sans traitement sur une période
+apparaît avec n_traitements = 0, il n'est pas absent du tableau.
 
 Le portefeuille est STATIQUE (pas d'historisation) : un compte a un seul
 profil_partenaire et une seule relation_contractuelle, fixes dans le temps.
@@ -38,8 +36,18 @@ def resolve_profile_and_relation(treatments_df: pd.DataFrame, portfolio_df: pd.D
     donnée, car le lift/taux de "Autres" mélange alors des comptes réels
     classés "Autres" ET des traitements non rattachables (voir
     compute_data_quality plus bas).
+
+    Preserve les colonnes existantes : motif, sous_motif (si présentes).
     """
     df = treatments_df.copy()
+    # Les colonnes motif/sous_motif (si présentes à l'import ou générées
+    # synthétiquement) sont indépendantes de l'identification du compte :
+    # on les laisse passer telles quelles, et on crée les colonnes vides
+    # si elles sont absentes (rétrocompatibilité avec l'ancien schéma).
+    for col in ("motif", "sous_motif"):
+        if col not in df.columns:
+            df[col] = None
+
     df["compte_identifie"] = df["account_id"].notna()
 
     with_account = df[df["compte_identifie"]].copy()
@@ -58,11 +66,13 @@ def resolve_profile_and_relation(treatments_df: pd.DataFrame, portfolio_df: pd.D
     without_account["relation_contractuelle"] = FALLBACK_SEGMENT_LABEL
 
     result = pd.concat([joined, without_account], ignore_index=True, sort=False)
-    return result.sort_values("date_contact").reset_index(drop=True)
+    result = result.sort_values("date_contact").reset_index(drop=True)
+    # motif/sous_motif passent tels quels (déjà préservés dans df)
+    return result
 
 
 def compute_data_quality(resolved_df: pd.DataFrame) -> dict:
-    """Indicateur de qualité de donnée séparé (décision produit) : la part de
+    """Indicateur de qualité de donnée séparé : la part de
     traitements non identifiables, globalement / par canal, et la part du
     panier "Autres" qui vient de traitements sans compte réel plutôt que de
     vrais comptes classés "Autres" dans le portefeuille."""
@@ -112,7 +122,7 @@ def build_period_index(start, end, freq_code: str) -> pd.DatetimeIndex:
     return pd.date_range(start=start, end=end, freq=freq_code)
 
 
-def _floor_to_period(timestamps: pd.Series, freq_code: str) -> pd.Series:
+def floor_to_period(timestamps: pd.Series, freq_code: str) -> pd.Series:
     """Ramène chaque timestamp au début de sa période (jour / semaine / mois)."""
     if freq_code == "D":
         return timestamps.dt.floor("D")
@@ -124,7 +134,7 @@ def _floor_to_period(timestamps: pd.Series, freq_code: str) -> pd.Series:
 
 
 def _floor_scalar_to_period(ts, freq_code: str) -> pd.Timestamp:
-    """Équivalent scalaire de _floor_to_period, pour caler les bornes (start/end)."""
+    """Équivalent scalaire de floor_to_period, pour caler les bornes (start/end)."""
     ts = pd.Timestamp(ts)
     if freq_code == "D":
         return ts.floor("D")
@@ -150,11 +160,35 @@ def aggregate_treatments(treatments_df: pd.DataFrame, freq_code: str) -> pd.Data
     """Agrège les traitements (déjà résolus/filtrés) par (période, profil) :
     n_traitements, n_comptes_distincts."""
     df = treatments_df.copy()
-    df["period"] = _floor_to_period(df["date_contact"], freq_code)
+    df["period"] = floor_to_period(df["date_contact"], freq_code)
 
     agg = (
         df.groupby(["period", "profil_partenaire"])
         .agg(n_traitements=("traitement_id", "count"), n_comptes_distincts=("account_id", "nunique"))
+        .reset_index()
+    )
+    return agg
+
+
+def aggregate_treatments_by_motif(
+    treatments_df: pd.DataFrame, freq_code: str
+) -> pd.DataFrame:
+    """
+    Agrège les traitements par (période, profil_partenaire, motif, sous_motif) :
+    n_traitements.
+    Utile pour la vue de qualification (drill-down motif ET sous-motif).
+    Retourne un DataFrame avec colonnes :
+    period, profil_partenaire, motif, sous_motif, n_traitements.
+    Les traitements sans motif qualifié (motif is None) sont comptés dans
+    la ligne motif=None / sous_motif=None afin de garder la conservation
+    du volume (100 % = qualifiés + non qualifiés).
+    """
+    df = treatments_df.copy()
+    df["period"] = floor_to_period(df["date_contact"], freq_code)
+
+    agg = (
+        df.groupby(["period", "profil_partenaire", "motif", "sous_motif"], dropna=False)
+        .agg(n_traitements=("traitement_id", "count"))
         .reset_index()
     )
     return agg
@@ -174,7 +208,7 @@ def build_master_table(
     freq_code: str,
     start_date=None,
     end_date=None,
-    drop_incomplete_last_period: bool = True,
+    drop_incomplete_periods: bool = True,
 ) -> pd.DataFrame:
     """Table maître tidy : period | profil_partenaire | n_traitements | n_comptes_distincts | n_accounts.
 
@@ -186,16 +220,17 @@ def build_master_table(
     statique) : elle est simplement répétée sur chaque période de la grille.
 
     Complète les zéros pour toute combinaison (période, profil) sans traitement.
-    Si `drop_incomplete_last_period` est vrai (par défaut), la dernière période
-    est retirée si elle dépasse la dernière donnée réellement disponible
-    (jour/semaine/mois en cours, partiel) — sinon taux/lift/prévisions seraient
-    biaisés par un simple effet de troncature.
+    Si `drop_incomplete_periods` est vrai (par défaut), la première et la dernière
+    période sont retirées si elles dépassent les données réellement disponibles
+    (historique commencé en milieu de semaine, mois en cours...) — sinon
+    taux/lift/prévisions seraient biaisés par un simple effet de troncature.
     """
     if start_date is None:
         start_date = treatments_df["date_contact"].min()
     if end_date is None:
         end_date = treatments_df["date_contact"].max()
 
+    data_start_ts = treatments_df["date_contact"].min().normalize()
     data_limit_ts = treatments_df["date_contact"].max()
 
     start_date = _floor_scalar_to_period(start_date, freq_code)
@@ -203,7 +238,9 @@ def build_master_table(
 
     period_index = build_period_index(start_date, end_date, freq_code)
 
-    if drop_incomplete_last_period:
+    if drop_incomplete_periods:
+        while len(period_index) > 0 and period_index[0] < data_start_ts:
+            period_index = period_index[1:]
         while len(period_index) > 0 and _period_end(period_index[-1], freq_code) > data_limit_ts:
             period_index = period_index[:-1]
 

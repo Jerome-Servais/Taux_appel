@@ -4,7 +4,8 @@ data/loader.py — Chargement des données brutes.
 Deux sources possibles :
 1. Générateur de données synthétiques (démonstration, aucune donnée réelle requise)
 2. Import CSV respectant le schéma réel (traitements + portefeuille) :
-   - Traitements.csv  : traitement_id | account_id (parfois vide) | date_contact | type_traitement (appel/email)
+   - Traitements.csv  : traitement_id | account_id (parfois vide) | date_contact | type_traitement (appel/email),
+     plus motif et sous_motif si disponibles
    - Portefeuille.csv : account_id | profil_partenaire | relation_contractuelle
 
 Portefeuille simplifié (pas d'historisation) : chaque compte a un seul profil
@@ -35,6 +36,13 @@ from config import (
     FALLBACK_SEGMENT_LABEL,
     PORTFOLIO_ALIASES,
     TRAITEMENTS_ALIASES,
+    TRAITEMENTS_OPTIONAL_ALIASES,
+)
+from data.motif_taxonomy import (
+    MISSING_MOTIF_RATE,
+    MISSING_SOUS_MOTIF_RATE,
+    MOTIF_WEIGHTS,
+    TAXONOMY,
 )
 
 
@@ -86,6 +94,10 @@ def generate_synthetic_treatments(
     end_date=DEMO_END_DATE,
     profiles: dict | None = None,
     seed: int = 7,
+    motif_anomaly_profile: str | None = "Fragile",
+    motif_anomaly_motif: str = "Réclamation",
+    motif_anomaly_start: str | None = None,
+    motif_anomaly_multiplier: float = 3.5,
 ) -> pd.DataFrame:
     """Génère la table brute des traitements (1 ligne = 1 appel ou 1 email).
 
@@ -96,6 +108,17 @@ def generate_synthetic_treatments(
     - pics de campagne email périodiques -> sur-dispersion réaliste du canal email
       (variance >> moyenne : Poisson devient inadapté, cf. Binomiale négative)
     - une fraction de traitements sans account_id, selon le canal
+    - motif / sous_motif : distribution non uniforme, fraction non qualifiée
+      (MISSING_MOTIF_RATE par canal), et injection optionnelle d'une anomalie
+      de motif (un motif qui devient subitement surreprésenté pour un profil
+      donné sur la dernière portion de la série — testable avec la vue de
+      qualification)
+
+    Paramètres d'injections d'anomalie motif :
+    - motif_anomaly_profile : profil sur lequel l'anomalie est injectée
+    - motif_anomaly_motif   : motif dont la fréquence est multipliée
+    - motif_anomaly_start   : date de début (str ISO, défaut = dernier tiers)
+    - motif_anomaly_multiplier : facteur de sur-représentation du motif
     """
     rng = np.random.default_rng(seed)
     profiles = profiles or DEMO_PROFILES
@@ -106,9 +129,28 @@ def generate_synthetic_treatments(
 
     breakpoint_date = pd.Timestamp(start_date) + (pd.Timestamp(end_date) - pd.Timestamp(start_date)) * 2 // 3
 
+    # date de début de l'anomalie motif : dernier tiers par défaut
+    if motif_anomaly_start is not None:
+        anomaly_start_ts = pd.Timestamp(motif_anomaly_start)
+    else:
+        anomaly_start_ts = pd.Timestamp(start_date) + (pd.Timestamp(end_date) - pd.Timestamp(start_date)) * 2 // 3
+
     # quelques jours de campagne email par trimestre environ, tirés à l'avance
     n_campaigns = max(1, int(len(dates) / 90))
     campaign_days = set(rng.choice(dates, size=n_campaigns, replace=False))
+
+    # pré-calcul des poids de motif normalisés (utilisés dans la boucle interne)
+    motif_names = list(MOTIF_WEIGHTS.keys())
+    motif_base_probs = np.array([MOTIF_WEIGHTS[m] for m in motif_names], dtype=float)
+    motif_base_probs /= motif_base_probs.sum()
+
+    # poids de sous-motif par motif, normalisés
+    sous_motif_probs: dict[str, tuple[list[str], np.ndarray]] = {}
+    for motif, subs in TAXONOMY.items():
+        names_s = [sm for sm, _ in subs]
+        weights_s = np.array([w for _, w in subs], dtype=float)
+        weights_s /= weights_s.sum()
+        sous_motif_probs[motif] = (names_s, weights_s)
 
     rows = []
     treatment_id = 0
@@ -117,6 +159,7 @@ def generate_synthetic_treatments(
         weekend_factor_appel = 0.55 if weekday >= 5 else 1.0
         weekend_factor_email = 0.85 if weekday >= 5 else 1.0
         campaign_multiplier = 4.0 if d in campaign_days else 1.0
+        in_anomaly_window = pd.Timestamp(d) >= anomaly_start_ts
 
         for pname, cfg in profiles.items():
             accounts = accounts_by_profile.get(pname, [])
@@ -136,6 +179,21 @@ def generate_synthetic_treatments(
             lam_appel = n_accounts * appel_rate * weekend_factor_appel
             lam_email = n_accounts * email_rate * weekend_factor_email * campaign_multiplier
 
+            # poids de motif pour ce (profil, date), potentiellement modifiés
+            # si une anomalie est en cours pour ce profil
+            if (
+                in_anomaly_window
+                and motif_anomaly_profile is not None
+                and pname == motif_anomaly_profile
+                and motif_anomaly_motif in motif_names
+            ):
+                idx_anomaly = motif_names.index(motif_anomaly_motif)
+                motif_probs_eff = motif_base_probs.copy()
+                motif_probs_eff[idx_anomaly] *= motif_anomaly_multiplier
+                motif_probs_eff /= motif_probs_eff.sum()
+            else:
+                motif_probs_eff = motif_base_probs
+
             for canal, lam in (("appel", lam_appel), ("email", lam_email)):
                 n_today = rng.poisson(lam)
                 if n_today == 0:
@@ -143,21 +201,44 @@ def generate_synthetic_treatments(
                 callers = rng.choice(accounts, size=n_today, replace=True)
                 seconds_offsets = rng.integers(0, 24 * 3600, size=n_today)
                 missing_mask = rng.random(n_today) < MISSING_ACCOUNT_RATE[canal]
-                for aid, offset, is_missing in zip(callers, seconds_offsets, missing_mask):
+
+                # qualification motif/sous-motif (avec valeurs manquantes)
+                no_motif_mask = rng.random(n_today) < MISSING_MOTIF_RATE.get(canal, 0.15)
+                no_sous_motif_mask = rng.random(n_today) < MISSING_SOUS_MOTIF_RATE
+
+                motifs_today = rng.choice(motif_names, size=n_today, p=motif_probs_eff)
+
+                for i, (aid, offset, is_missing) in enumerate(
+                    zip(callers, seconds_offsets, missing_mask)
+                ):
                     ts = pd.Timestamp(d) + pd.Timedelta(seconds=int(offset))
                     acc = None if is_missing else int(aid)
-                    rows.append((treatment_id, acc, ts, canal))
+
+                    if no_motif_mask[i]:
+                        m, sm = None, None
+                    else:
+                        m = motifs_today[i]
+                        if no_sous_motif_mask[i]:
+                            sm = None
+                        else:
+                            sm_names, sm_probs = sous_motif_probs[m]
+                            sm = sm_names[int(rng.choice(len(sm_names), p=sm_probs))]
+
+                    rows.append((treatment_id, acc, ts, canal, m, sm))
                     treatment_id += 1
 
-    treatments_df = pd.DataFrame(rows, columns=["traitement_id", "account_id", "date_contact", "type_traitement"])
+    treatments_df = pd.DataFrame(
+        rows,
+        columns=["traitement_id", "account_id", "date_contact", "type_traitement", "motif", "sous_motif"],
+    )
     treatments_df["account_id"] = treatments_df["account_id"].astype("Int64")  # nullable int
     return treatments_df.sort_values("date_contact").reset_index(drop=True)
 
 
-def load_demo_data():
+def load_demo_data(start_date=DEMO_START_DATE, end_date=DEMO_END_DATE):
     """Génère et retourne (treatments_df, portfolio_df) de démonstration."""
     portfolio_df = generate_synthetic_portfolio()
-    treatments_df = generate_synthetic_treatments(portfolio_df)
+    treatments_df = generate_synthetic_treatments(portfolio_df, start_date, end_date)
     return treatments_df, portfolio_df
 
 
@@ -249,11 +330,9 @@ def _canonicalize_categorical(series: pd.Series) -> pd.Series:
 
 
 def _parse_date_contact(series: pd.Series) -> pd.Series:
-    """Parse date_contact au format JJ/MM/AAAA HH:mm:ss (confirmé par
-    l'utilisateur). Sans format explicite, pandas suppose par défaut le format
-    américain (mois/jour/année) et inverserait silencieusement jour et mois
-    pour toute date où le jour est <= 12 — d'où un format imposé plutôt qu'une
-    inférence automatique.
+    """Parse date_contact au format JJ/MM/AAAA HH:mm:ss. Le format est imposé, car
+    pandas suppose sinon le format américain et inverserait jour et mois pour toute
+    date dont le jour est <= 12.
 
     Un repli avec dayfirst=True absorbe les petites variantes (secondes
     absentes, séparateur différent) tout en préservant l'interprétation
@@ -271,13 +350,28 @@ def _parse_date_contact(series: pd.Series) -> pd.Series:
             )
 
 
+def _map_optional_motif_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Reprend motif et sous_motif s'ils existent, sinon crée des colonnes vides.
+    Une valeur vide ou composée d'espaces correspond à un traitement non qualifié."""
+    normalized = {_normalize_colname(column): column for column in df.columns}
+    for canonical, aliases in TRAITEMENTS_OPTIONAL_ALIASES.items():
+        found = next((normalized[alias] for alias in aliases if alias in normalized), None)
+        if found is None:
+            df[canonical] = None
+            continue
+        values = df[found].astype("object").where(df[found].notna())
+        df[canonical] = values.map(lambda v: v.strip() if isinstance(v, str) else v).replace("", None)
+    return df
+
+
 def load_treatments_from_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
     df = _map_columns(df, TRAITEMENTS_ALIASES, "traitements")
+    df = _map_optional_motif_columns(df)
     df["date_contact"] = _parse_date_contact(df["date_contact"])
     df["type_traitement"] = df["type_traitement"].astype(str).str.strip().str.lower()
     df["account_id"] = pd.to_numeric(df["account_id"], errors="coerce").astype("Int64")
-    return df[["traitement_id", "account_id", "date_contact", "type_traitement"]]
+    return df[["traitement_id", "account_id", "date_contact", "type_traitement", "motif", "sous_motif"]]
 
 
 def load_portfolio_from_csv(file) -> pd.DataFrame:

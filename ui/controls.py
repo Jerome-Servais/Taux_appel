@@ -1,13 +1,11 @@
 """
 ui/controls.py — Widgets de personnalisation (sidebar).
 
-Chaque question méthodologique en suspens devient un contrôle interactif ici.
-Rien n'est tranché en dur : le dict retourné par `render_customization_controls`
-pilote tout le recalcul en aval (résolution, agrégation, taux, lift, alertes,
-prévision).
+Le dict retourné par `render_customization_controls` pilote tout le recalcul en
+aval : résolution, agrégation, taux, lift, alertes et prévision.
 
 Canal et relation contractuelle sont traités comme deux filtres indépendants
-(décision produit), au même titre que le profil, plutôt que croisés
+au même titre que le profil, plutôt que croisés
 systématiquement — ce qui éviterait de diviser les volumes déjà surveillés par
 le garde-fou de fiabilité statistique.
 """
@@ -53,7 +51,8 @@ def render_data_source_controls() -> dict:
     if source_label == "Importer mes fichiers CSV":
         result["source"] = "upload"
         result["treatments_file"] = st.sidebar.file_uploader(
-            "Traitements (traitement_id, account_id, date_contact, type_traitement)", type="csv"
+            "Traitements (traitement_id, account_id, date_contact, type_traitement, motif et sous_motif facultatifs)",
+            type="csv",
         )
         result["portfolio_file"] = st.sidebar.file_uploader(
             "Portefeuille (account_id, profil_partenaire, relation_contractuelle)",
@@ -77,7 +76,7 @@ def render_customization_controls(
     rate_definition = RATE_DEFINITIONS[rate_label]
 
     # --- Granularité temporelle ---
-    gran_label = st.sidebar.radio("Granularité temporelle", list(GRANULARITIES.keys()), index=2)
+    gran_label = st.sidebar.radio("Granularité temporelle", list(GRANULARITIES.keys()), index=1)
     freq_code = GRANULARITIES[gran_label]
 
     st.sidebar.divider()
